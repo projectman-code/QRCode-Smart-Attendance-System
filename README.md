@@ -77,7 +77,9 @@ TrackAS is a smart attendance system built using React and Vite. It leverages QR
 
     - Create a new project in your Supabase account.
     - Note down your Supabase Project URL and Anon Key.
-    - Set up the necessary database tables and RLS (Row Level Security) policies as required by the application. (You may need to add specific table/schema details here if they are standard or crucial for setup).
+    - In **Authentication -> Providers -> Email**, turn **off** "Confirm email".
+    - Open **SQL Editor -> New query**, paste the whole of [`supabase/schema.sql`](supabase/schema.sql) and run it. This creates the `lecturers` and `classes` tables, the Row Level Security policies, and the two server functions students use (`get_class_public` and `mark_attendance`). The server checks distance, the attendance time window and duplicates, so these rules cannot be bypassed from the browser.
+    - Attendance is open from 30 minutes before the class time until 3 hours after, and the allowed distance is 20 m (plus up to 25 m of GPS accuracy). Both can be changed per class through the `radius_m`, `opens_before_minutes` and `window_minutes` columns.
 
 4.  **Configure environment variables:**
 
