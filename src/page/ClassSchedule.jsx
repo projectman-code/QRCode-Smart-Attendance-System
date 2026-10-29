@@ -44,9 +44,13 @@ const ClassSchedule = () => {
   const handleSubmit = async (e) => {
     e.preventDefault();
 
-    let locationGeography = null;
-    if (selectedLocationCordinate) {
-      locationGeography = `SRID=4326;POINT(${selectedLocationCordinate.lng} ${selectedLocationCordinate.lat})`;
+    if (!selectedLocationCordinate) {
+      toast.error("Please select the lecture venue on the map first.");
+      return;
+    }
+    if (!lecturerId) {
+      toast.error("Your lecturer profile could not be loaded. Please log in again.");
+      return;
     }
 
     const { courseTitle, courseCode, lectureVenue, time, date, note } =
@@ -85,7 +89,8 @@ const ClassSchedule = () => {
           course_code: courseCode,
           time: new Date(`${date}T${time}`).toISOString(),
           date: new Date(date).toISOString(),
-          location: locationGeography,
+          lat: selectedLocationCordinate.lat,
+          lng: selectedLocationCordinate.lng,
           note: note,
           qr_code: qrCodeDataUrl,
           lecturer_id: lecturerId,
@@ -102,13 +107,11 @@ const ClassSchedule = () => {
 
       // Extract and use the generated course_id
       const generatedCourseId = data[0]?.course_id;
+      // Only the class id goes in the link; the venue and rules are read
+      // from the database, so the link cannot be edited to cheat.
       const updatedRegistrationLink = `${VERCEL_URL}/attendance?courseId=${encodeURIComponent(
         generatedCourseId
-      )}&time=${encodeURIComponent(time)}&courseCode=${encodeURIComponent(
-        courseCode
-      )}&lat=${selectedLocationCordinate?.lat}&lng=${
-        selectedLocationCordinate?.lng
-      }`;
+      )}`;
 
       // Set the QR code data and open the QR modal
       setQrData(updatedRegistrationLink);
