@@ -1,5 +1,5 @@
 import { useLocation, useNavigate } from "react-router-dom";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { calculateDistance } from "../utils/distanceCalculation";
 import Input from "../component/Input";
 import { supabase } from "../utils/supabaseClient";
@@ -8,130 +8,174 @@ import Spinner from "../component/Spinner";
 import dayjs from "dayjs";
 import logo from "../../public/trackAS.png";
 
+const getPositionOnce = (options) =>
+  new Promise((resolve, reject) => {
+    navigator.geolocation.getCurrentPosition(
+      (p) =>
+        resolve({
+          lat: p.coords.latitude,
+          lng: p.coords.longitude,
+          accuracy: p.coords.accuracy,
+        }),
+      (err) => {
+        const e = new Error(err.message);
+        e.code = err.code; // 1 = blocked, 2 = unavailable, 3 = timed out
+        reject(e);
+      },
+      options
+    );
+  });
+
+// Try a fresh high-accuracy GPS fix first. If GPS is slow or unavailable,
+// fall back to a rougher location (Wi-Fi / network) instead of giving up.
+const getPosition = async () => {
+  if (!navigator.geolocation) {
+    const e = new Error("This browser cannot read your location.");
+    e.code = 0;
+    throw e;
+  }
+  try {
+    return await getPositionOnce({
+      enableHighAccuracy: true,
+      timeout: 10000,
+      maximumAge: 0,
+    });
+  } catch (e) {
+    if (e.code === 1) throw e; // blocked: trying again will not help
+    return await getPositionOnce({
+      enableHighAccuracy: false,
+      timeout: 20000,
+      maximumAge: 60000,
+    });
+  }
+};
+
+const locationHelp = (e) => {
+  if (e.code === 1)
+    return "Location is blocked. Allow location for this website in your browser settings (lock icon next to the address), then tap Try again.";
+  if (e.code === 2)
+    return "Your device could not find your location. Turn on GPS / location, go near a window or outside, then tap Try again.";
+  if (e.code === 3)
+    return "Finding your location took too long. Go near a window or outside, then tap Try again.";
+  return e.message || "Could not read your location. Tap Try again.";
+};
+
 const StudentLogin = () => {
   const location = useLocation();
   const navigate = useNavigate();
-  const queryParams = new URLSearchParams(location.search);
+  const courseId = new URLSearchParams(location.search).get("courseId");
 
   const [isLoading, setIsLoading] = useState(false);
-
-  const [userDistance, setUserDistance] = useState(null);
-  const [isWithinRange, setIsWithinRange] = useState(false);
-  const [classDetails, setClassDetails] = useState(null);
+  const [classInfo, setClassInfo] = useState(null);
+  const [loadError, setLoadError] = useState("");
+  const [position, setPosition] = useState(null);
+  const [locating, setLocating] = useState(false);
+  const [locationError, setLocationError] = useState("");
   const [matricNumber, setMatricNumber] = useState("");
   const [name, setName] = useState("");
 
-  const courseId = queryParams.get("courseId");
-  const courseCode = queryParams.get("courseCode");
-  const lat = parseFloat(queryParams.get("lat"));
-  const lng = parseFloat(queryParams.get("lng"));
-
+  // The class details (including the venue coordinates) come from the
+  // database, not from the link, so editing the link changes nothing.
   useEffect(() => {
     const fetchClassDetails = async () => {
-      const { data, error } = await supabase
-        .from("classes")
-        .select("*")
-        .eq("course_id", courseId)
-        .single();
-
-      if (error) {
-        console.error("Error fetching class details:", error);
-      } else {
-        setClassDetails(data);
+      if (!courseId) {
+        setLoadError("This attendance link is not valid.");
+        return;
       }
+      const { data, error } = await supabase.rpc("get_class_public", {
+        p_course_id: courseId,
+      });
+      if (error || !data || data.length === 0) {
+        setLoadError("This attendance link is not valid.");
+        return;
+      }
+      setClassInfo(data[0]);
     };
 
     fetchClassDetails();
   }, [courseId]);
 
+  const refreshPosition = useCallback(async () => {
+    setLocating(true);
+    setLocationError("");
+    try {
+      const p = await getPosition();
+      setPosition(p);
+      return p;
+    } catch (e) {
+      setLocationError(locationHelp(e));
+      return null;
+    } finally {
+      setLocating(false);
+    }
+  }, []);
+
   useEffect(() => {
-    const getUserLocation = () => {
-      if (navigator.geolocation) {
-        navigator.geolocation.getCurrentPosition(
-          (position) => {
-            const userLat = position.coords.latitude;
-            const userLng = position.coords.longitude;
+    refreshPosition();
+  }, [refreshPosition]);
 
-            const distance = calculateDistance(userLat, userLng, lat, lng);
-            setUserDistance(distance);
-
-            // Check if the distance is within 20 meters
-            setIsWithinRange(distance <= 20);
-          },
-          (error) => {
-            toast.error(`Error getting user location., ${error.message}`);
-          }
-        );
-      } else {
-        toast.error("Geolocation is not supported by this browser.");
-      }
-    };
-
-    getUserLocation();
-  }, [lat, lng]);
+  const userDistance =
+    classInfo && position
+      ? calculateDistance(position.lat, position.lng, classInfo.lat, classInfo.lng)
+      : null;
+  const radius = classInfo?.radius_m ?? 20;
+  // Display only. The server repeats this check and is the one that decides.
+  const isWithinRange = userDistance !== null && userDistance <= radius + 25;
+  const isOpen = classInfo?.is_open ?? false;
 
   const handleRegister = async (e) => {
     e.preventDefault();
 
-    if (!matricNumber) {
+    if (!name.trim()) {
+      toast.error("Your name is required.");
+      return;
+    }
+    if (!matricNumber.trim()) {
       toast.error("Matriculation number is required.");
       return;
     }
 
     setIsLoading(true);
 
-    const { data, error } = await supabase
-      .from("classes")
-      .select("attendees")
-      .eq("course_id", courseId)
-      .single();
+    // Use a fresh GPS reading at the moment of submitting.
+    const p = await refreshPosition();
+    if (!p) {
+      setIsLoading(false);
+      return;
+    }
+
+    const { error } = await supabase.rpc("mark_attendance", {
+      p_course_id: courseId,
+      p_matric_no: matricNumber,
+      p_name: name,
+      p_lat: p.lat,
+      p_lng: p.lng,
+      p_accuracy: p.accuracy,
+    });
+
+    setIsLoading(false);
 
     if (error) {
-      toast.error(`Error fetching class data: ${error.message}`);
-      setIsLoading(false);
+      toast.error(error.message);
       return;
     }
 
-    const { attendees = [] } = data;
-
-    // Check if the matriculation number already exists
-    const matricNumberExists = attendees.some(
-      (attendee) => attendee.matric_no === matricNumber.trim().toUpperCase()
-    );
-
-    if (matricNumberExists) {
-      toast.error("This matriculation number has already been registered.");
-      setIsLoading(false);
-      return;
-    }
-
-    const newAttendee = {
-      matric_no: matricNumber.trim().toUpperCase(),
-      name: name.toUpperCase(),
-      timestamp: new Date().toISOString(),
-    };
-
-    const updatedAttendees = [...attendees, newAttendee];
-
-    const { error: updateError } = await supabase
-      .from("classes")
-      .update({ attendees: updatedAttendees })
-      .eq("course_id", courseId);
-
-    if (updateError) {
-      toast.error(`Error marking attendance: ${updateError.message}`);
-    } else {
-      toast.success("Attendance marked successfully.");
-
-      // Clear input fields
-      setMatricNumber("");
-      setName("");
-      setIsLoading(false);
-
-      // Redirect to success page
-      navigate("/success", { replace: true });
-    }
+    toast.success("Attendance marked successfully.");
+    setMatricNumber("");
+    setName("");
+    navigate("/success", { replace: true });
   };
+
+  if (loadError) {
+    return (
+      <section className="studentLogin h-screen grid place-items-center">
+        <div className="bg-white px-6 py-4 rounded-xl text-center">
+          <img src={logo} alt="logo" className="mx-auto" />
+          <p className="text-red-500 font-semibold mt-4">{loadError}</p>
+        </div>
+      </section>
+    );
+  }
 
   return (
     <section className="studentLogin h-screen grid place-items-center ">
@@ -142,39 +186,60 @@ const StudentLogin = () => {
         <h2 className="text-[2.5rem] text-[#000D46] text-center font-bold mb-2">
           TrackAS
         </h2>
-        {classDetails && (
+        {classInfo && (
           <div className="flex justify-between items-center">
             <div>
               <p className="text-[#000D46] font-bold">
-                Title {classDetails.course_title}
+                Title: {classInfo.course_title}
               </p>
-
-              <p className="text-[#000D46]  font-bold">Code: {courseCode}</p>
-
-              <p>
-                <p className="text-[#000D46]  font-bold">
-                  Venue: {classDetails.location_name}
-                </p>
-                <p className="text-[#000D46]  font-bold">
-                  Date: {dayjs(classDetails.date).format("DD MMMM, YYYY")}
-                </p>
-                <p className="text-[#000D46]  font-bold">
-                  Time:{" "}
-                  {new Date(classDetails.time).toLocaleTimeString([], {
-                    hour: "2-digit",
-                    minute: "2-digit",
-                    hour12: true,
-                  })}
-                </p>
+              <p className="text-[#000D46]  font-bold">
+                Code: {classInfo.course_code}
+              </p>
+              <p className="text-[#000D46]  font-bold">
+                Venue: {classInfo.location_name}
+              </p>
+              <p className="text-[#000D46]  font-bold">
+                Date: {dayjs(classInfo.class_time).format("DD MMMM, YYYY")}
+              </p>
+              <p className="text-[#000D46]  font-bold">
+                Time: {dayjs(classInfo.class_time).format("hh:mm A")}
+              </p>
+              {classInfo.note && (
                 <p className="text-[#000D46] mb-2 text-lg font-bold">
-                  Note: {classDetails.note}
+                  Note: {classInfo.note}
                 </p>
+              )}
+              <p>
                 Distance to Lecture Venue:{" "}
-                {userDistance
+                {userDistance !== null
                   ? `${userDistance.toFixed(2)} meters`
-                  : "Calculating..."}
+                  : locating
+                  ? "Calculating..."
+                  : "Unknown (location not available)"}
               </p>
+              {position?.accuracy ? (
+                <p className="text-xs text-gray-500">
+                  GPS accuracy: about {Math.round(position.accuracy)} m
+                </p>
+              ) : null}
             </div>
+          </div>
+        )}
+        {locating && !position && (
+          <p className="text-sm text-gray-600 mt-2">
+            Getting your location... please wait.
+          </p>
+        )}
+        {locationError && (
+          <div className="mt-2">
+            <p className="text-sm text-red-500">{locationError}</p>
+            <button
+              type="button"
+              onClick={refreshPosition}
+              className="btn btn-sm mt-2"
+            >
+              Try again
+            </button>
           </div>
         )}
         <form onSubmit={handleRegister}>
@@ -196,13 +261,24 @@ const StudentLogin = () => {
             onChange={(e) => setMatricNumber(e.target.value)}
           />
 
-          {isWithinRange ? (
-            <button className="btn my-5 btn-block text-lg" type="submit">
+          {classInfo && !isOpen ? (
+            <p className="text-xs text-red-500 pt-2">
+              Attendance is not open for this class right now. It is open from{" "}
+              {dayjs(classInfo.opens_at).format("DD MMM, hh:mm A")} to{" "}
+              {dayjs(classInfo.closes_at).format("DD MMM, hh:mm A")}.
+            </p>
+          ) : isWithinRange ? (
+            <button
+              className="btn my-5 btn-block text-lg"
+              type="submit"
+              disabled={isLoading}
+            >
               {isLoading ? <Spinner /> : "Mark Attendance"}
             </button>
           ) : (
             <p className="text-xs text-red-500 pt-2">
-              You must be within 20 meters of the lecture venue to register.
+              You must be within {radius} meters of the lecture venue to
+              register.
             </p>
           )}
         </form>
